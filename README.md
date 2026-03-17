@@ -1,6 +1,6 @@
 # Beat Pulse (BPM)
 
-Current Version: v0.1.0 (beta)
+Current Version: v0.1.1 (beta)
 
 Beat Pulse (BPM) is a DaVinci Resolve **Fusion modifier** that beat-syncs **any numeric parameter** to music (Angle, Size/Zoom, Glow, Blur, Opacity, etc.).
 
