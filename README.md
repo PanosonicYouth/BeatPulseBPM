@@ -22,6 +22,28 @@ Stack up to **4 pulses**, use **musical note divisions** (straight / triplet / d
 
 ---
 
+## Prerequisites (important)
+
+- You need the **exact BPM** of your track.  
+  **Recommended:** use a DAW (e.g. **Ableton Live**) to *identify/confirm* the BPM and (ideally) **warp/enforce a constant tempo** before animating.
+
+- For best results, your audio should start **exactly on Beat 1** (no gap/silence before the first downbeat).  
+  If your track starts late, you can either:
+  - **trim/slide the audio** so the first downbeat lands at the start of the timeline, **or**
+  - compensate using **Phase → Custom (beats)** and keyframe **Custom Phase (beats)** to align.
+
+---
+
+## Download
+
+1. Go to the latest Release:  
+   https://github.com/PanosonicYouth/BeatPulseBPM/releases/latest
+2. Under **Assets**, download:  
+   - ✅ **BeatPulseBPM_VX.X.X.zip** *(recommended — includes the `.fuse`, PDF manual, and demo project)*  
+   - or download individual files: `BeatPulseBPM.fuse`, `BeatPulseBPM_Manual.pdf`, `BeatPulseDemo.zip`
+  
+---
+
 ## Install
 
 1. Download `BeatPulseModifier.fuse`
