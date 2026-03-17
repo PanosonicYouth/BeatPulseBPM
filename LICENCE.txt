@@ -1,0 +1,48 @@
+Beat Pulse Source-Available License (BPSAL) v1.0
+Copyright (c) 2026 PanosonicYouth
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated files (the “Software”), to use the Software for personal or commercial purposes,
+and to modify the Software for personal or internal use, subject to the restrictions below.
+
+1) No Sale
+You may not sell, license, or otherwise commercialize the Software itself, whether in original
+or modified form. This includes selling access to the Software, charging for downloads, or
+including the Software as a paid add-on.
+
+2) Redistribution of Original Only
+You may redistribute ONLY unmodified copies of the Software, free of charge, provided that:
+  a) the redistribution includes this LICENSE file and all copyright notices; and
+  b) you do not claim authorship or imply endorsement by the copyright holder; and
+  c) you do not charge any fee for the Software itself (hosting fees/donation links must not
+     restrict access to the Software).
+
+“Unmodified” means byte-for-byte identical to the official release as published by the
+copyright holder.
+
+3) No Distribution of Modified Versions
+You may not distribute modified versions of the Software. This includes publishing modified
+copies, forks with modified releases, compiled/packaged builds, or rehosting modified files.
+You may, however, submit modifications to the copyright holder via pull request or patch for
+consideration.
+
+4) No Bundling / No Incorporation
+You may not bundle the Software with any product, plugin pack, template pack, course files,
+installer, distribution, or other collection (free or paid) without prior written permission.
+You may not incorporate the Software’s source code (in whole or in part) into another software
+product or service without prior written permission.
+
+5) Trademarks / Attribution
+This license does not grant permission to use the copyright holder’s name, branding, or
+trademarks to promote derived works or imply endorsement.
+
+6) Dual Licensing / Additional Permissions
+The copyright holder may offer the Software under additional or alternative terms (including
+commercial licenses). Any such permission must be granted in writing by the copyright holder.
+
+7) Disclaimer
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

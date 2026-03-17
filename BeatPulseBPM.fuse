@@ -1,0 +1,600 @@
+-- BeatPulseModifier.fuse (Resolve 20)
+-- Version: v0.1.0 (beta)
+-- Build: 2026-03-17
+-- 4-pulse stacked beat modifier with collapsible UI + per-pulse enable.
+-- Master: BPM/FPS + alignment + time signature + final operation
+-- Pulses: independent settings summed together
+-- Each Pulse can use Manual (beats) OR Musical (division + feel)
+
+FuRegisterClass("BeatPulseModifier", CT_Modifier, {
+  REGS_Category       = "Modifiers",
+  REGS_OpIconString   = "BPM",
+  REGS_OpDescription  = "Beat Pulse (BPM) - 4 Pulse Stack",
+  REGS_Name           = "Beat Pulse (BPM)",
+
+  REGID_DataType      = "Number",
+  REGID_InputDataType = "Number",
+
+  REG_TimeVariant     = true,
+  REGB_Temporal       = true,
+
+  REG_Version         = 110,
+})
+
+print("[BeatPulseModifier] loaded")
+
+-- IO
+InParameter = nil
+OutValue    = nil
+
+-- Master controls
+M_BPM = nil
+M_FPSPreset = nil
+M_AlignPeak = nil
+M_BeatsPerBar = nil
+M_Operation = nil
+
+-- Per-pulse control tables
+L = { {}, {}, {}, {} }
+
+-- ---------- Helpers ----------
+local function clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
+end
+
+local function sign(v)
+  if v > 0 then return 1 end
+  if v < 0 then return -1 end
+  return 0
+end
+
+local function fract(x) return x - math.floor(x) end
+local function wrapHalf(x) return x - math.floor(x + 0.5) end
+
+local function presetIndexToFPS(idx)
+  local map = { 23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 90.0, 100.0, 120.0 }
+  idx = math.floor(idx + 0.5)
+  if idx < 0 then idx = 0 end
+  if idx > 11 then idx = 11 end
+  return map[idx + 1]
+end
+
+local function autoPeakPos(wt)
+  -- 0=sine, 1=cos, 2=square, 3=saw
+  if wt == 0 then return 0.25 end
+  if wt == 1 then return 0.00 end
+  if wt == 3 then return 0.50 end
+  return 0.00
+end
+
+local function setDisabled(inp, disabled)
+  if inp then inp:SetAttrs({ INP_Disabled = disabled }) end
+end
+
+local function setNumberInput(inp, value)
+  if not inp then return end
+  local wasDisabled = inp:GetAttr("INP_Disabled")
+  if wasDisabled then inp:SetAttrs({ INP_Disabled = false }) end
+  inp:SetSource(Number(value), 0)
+  if wasDisabled then inp:SetAttrs({ INP_Disabled = true }) end
+end
+
+-- ---------- Musical timing ----------
+-- TimingMode: 0 = Manual (beats), 1 = Musical (division + feel)
+local function computePulseEveryBeats(layer, req, beatsPerBar)
+  local mode = math.floor(layer.TimingMode:GetValue(req).Value + 0.5)
+  if mode == 0 then
+    return clamp(layer.PulseEveryBeats:GetValue(req).Value, 0.0001, 100000)
+  end
+
+  local div  = math.floor(layer.Division:GetValue(req).Value + 0.5)
+  local feel = math.floor(layer.Feel:GetValue(req).Value + 0.5)
+
+  -- Base in beats
+  local base
+  if div == 0 then base = beatsPerBar        -- 1 Bar
+  elseif div == 1 then base = beatsPerBar/2  -- 1/2 Bar
+  elseif div == 2 then base = beatsPerBar/4  -- 1/4 Bar
+  elseif div == 3 then base = 4              -- Whole note
+  elseif div == 4 then base = 2              -- Half note
+  elseif div == 5 then base = 1              -- Quarter note
+  elseif div == 6 then base = 0.5            -- Eighth
+  elseif div == 7 then base = 0.25           -- 16th
+  else base = 0.125                          -- 32nd
+  end
+
+  local mult = 1.0
+  if feel == 1 then mult = 2.0/3.0           -- Triplet
+  elseif feel == 2 then mult = 3.0/2.0       -- Dotted
+  end
+
+  return clamp(base * mult, 0.0001, 100000)
+end
+
+local function refreshTimingUI(layer)
+  if not layer.TimingMode then return end
+  local mode = math.floor(layer.TimingMode:GetSource(0).Value + 0.5)
+  -- Musical mode: disable manual beats; enable division/feel
+  setDisabled(layer.PulseEveryBeats, mode ~= 0)
+  setDisabled(layer.Division, mode == 0)
+  setDisabled(layer.Feel, mode == 0)
+end
+
+-- ---------- Pulse envelope profile (fixed-peak) ----------
+-- sine/cos => smooth cosine taper
+-- saw      => linear taper
+-- square   => gate inside window
+local function fixedPeakEnv(x, atkW, relW, acv, rcv, wtProfile)
+  local eps = 1e-6
+  atkW = math.max(eps, atkW)
+  relW = math.max(eps, relW)
+
+  local d
+  if x < 0 then
+    d = (-x) / atkW
+    if d >= 1.0 then return 0.0 end
+    if wtProfile == 3 then
+      return math.pow(1.0 - d, acv)
+    elseif wtProfile == 2 then
+      return 1.0
+    else
+      return math.pow(math.cos(0.5 * math.pi * d), acv)
+    end
+  else
+    d = (x) / relW
+    if d >= 1.0 then return 0.0 end
+    if wtProfile == 3 then
+      return math.pow(1.0 - d, rcv)
+    elseif wtProfile == 2 then
+      return 1.0
+    else
+      return math.pow(math.cos(0.5 * math.pi * d), rcv)
+    end
+  end
+end
+
+-- ---------- Enable + Link UI ----------
+local function refreshPulseEnabledUI(i)
+  local layer = L[i]
+  if not layer.Enabled then return end
+
+  local on = (layer.Enabled:GetSource(0).Value >= 0.5)
+
+  -- Disable everything except the Enabled checkbox itself
+  for _, ctrl in ipairs(layer._allControls) do
+    if ctrl ~= layer.Enabled then
+      setDisabled(ctrl, not on)
+    end
+  end
+
+  if not on then return end
+
+  -- Timing UI (manual vs musical)
+  refreshTimingUI(layer)
+
+  -- Link A/R greys release + mirrors values
+  local link = (layer.LinkAR:GetSource(0).Value >= 0.5)
+  setDisabled(layer.ReleaseLen, link)
+  setDisabled(layer.ReleaseCurve, link)
+  if link then
+    setNumberInput(layer.ReleaseLen, layer.AttackLen:GetSource(0).Value)
+    setNumberInput(layer.ReleaseCurve, layer.AttackCurve:GetSource(0).Value)
+  end
+end
+
+local function syncReleaseToAttack(i)
+  local layer = L[i]
+  if not layer.LinkAR then return end
+  local link = (layer.LinkAR:GetSource(0).Value >= 0.5)
+  if not link then return end
+  setNumberInput(layer.ReleaseLen, layer.AttackLen:GetSource(0).Value)
+  setNumberInput(layer.ReleaseCurve, layer.AttackCurve:GetSource(0).Value)
+end
+
+-- ---------- Compute pulse contribution at time req ----------
+local function evalLayer(i, req, masterBPM, masterFPS, masterAlignPeak, beatsPerBar)
+  local layer = L[i]
+  if layer.Enabled:GetValue(req).Value < 0.5 then
+    return 0.0
+  end
+
+  local peb = computePulseEveryBeats(layer, req, beatsPerBar)
+
+  local gen = math.floor(layer.GenMode:GetValue(req).Value + 0.5)         -- 0 pulse, 1 osc
+  local wt  = math.floor(layer.WaveType:GetValue(req).Value + 0.5)
+  local pol = math.floor(layer.Polarity:GetValue(req).Value + 0.5)
+  local inv = (layer.Invert:GetValue(req).Value >= 0.5)
+
+  local atkPct = clamp(layer.AttackLen:GetValue(req).Value, 0.0, 100.0)
+  local relPct = clamp(layer.ReleaseLen:GetValue(req).Value, 0.0, 100.0)
+  local acv    = clamp(layer.AttackCurve:GetValue(req).Value, 0.0001, 100000)
+  local rcv    = clamp(layer.ReleaseCurve:GetValue(req).Value, 0.0001, 100000)
+
+  if layer.LinkAR:GetValue(req).Value >= 0.5 then
+    relPct = atkPct
+    rcv = acv
+  end
+
+  local shp = clamp(layer.ShapePow:GetValue(req).Value, 0.0001, 100000)
+
+  -- phase shift in beats (per-layer)
+  local pm = math.floor(layer.PhaseMode:GetValue(req).Value + 0.5) -- 0 on, 1 off, 2 custom
+  local pb = layer.PhaseBeats:GetValue(req).Value
+  if pm == 0 then pb = 0 end
+  if pm == 1 then pb = peb / 2.0 end
+
+  local t = req.Time / masterFPS
+  local twoPi = 2.0 * math.pi
+  local cyclesPerSec = (masterBPM / 60.0) / peb
+  local phase = twoPi * cyclesPerSec * t + twoPi * (pb / peb)
+
+  -- Peak positioning
+  local peakPos
+  if masterAlignPeak then
+    peakPos = 0.0
+  else
+    peakPos = autoPeakPos(wt)
+  end
+
+  -- Envelope window around peak (used for pulse mode and as amp window in osc mode)
+  local phaseFrac = fract(phase / twoPi)
+  local x = wrapHalf(phaseFrac - peakPos)
+
+  local atkW = math.max(1e-6, (atkPct / 100.0) * 0.5)
+  local relW = math.max(1e-6, (relPct / 100.0) * 0.5)
+
+  local env = fixedPeakEnv(x, atkW, relW, acv, rcv, wt)
+  env = math.pow(env, shp)
+  if inv then env = 1.0 - env end
+
+  local wave = 0.0
+
+  if gen == 0 then
+    -- Pulse (Envelope)
+    if pol == 0 then
+      wave = env
+    else
+      local sgn = sign(math.cos(phase - peakPos * twoPi))
+      wave = sgn * env
+    end
+  else
+    -- Oscillator (Waveform), amplitude-shaped by env
+    local s = math.sin(phase)
+    local c = math.cos(phase)
+    local sq = (s >= 0) and 1 or -1
+    local saw = 2.0 * ((phase / twoPi) - math.floor((phase / twoPi) + 0.5))
+
+    local osc = s
+    if wt == 1 then osc = c
+    elseif wt == 2 then osc = sq
+    elseif wt == 3 then osc = saw
+    end
+
+    if pol == 0 then
+      local osc01 = (wt == 2) and ((s >= 0) and 1 or 0) or clamp(0.5 * (osc + 1.0), 0.0, 1.0)
+      wave = osc01 * env
+    else
+      wave = osc * env
+    end
+  end
+
+  local amt = layer.Amount:GetValue(req).Value
+  return amt * wave
+end
+
+-- ---------- Create UI ----------
+function Create()
+  -- Main IO
+  InParameter = self:AddInput("Input (original value)", "ValueInput", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    LINK_Main = 1,
+    INP_MinScale = -1000,
+    INP_MaxScale = 1000,
+  })
+
+  OutValue = self:AddOutput("Output", "Output", {
+    LINKID_DataType = "Number",
+    LINK_Main = 1,
+  })
+
+  self:AddControlPage("Beat Pulse")
+
+  -- Master nest (expanded)
+  self:BeginControlNest("Master", "NestMaster", true)
+
+  M_BPM = self:AddInput("BPM", "BPM", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    INP_Default = 120,
+    INP_MinScale = 1, INP_MaxScale = 300,
+  })
+
+  M_FPSPreset = self:AddInput("FPS Preset", "FPSPreset", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ComboControl",
+    INP_Default = 4,
+    INP_Integer = true,
+    { CCS_AddString = "23.976" }, { CCS_AddString = "24" }, { CCS_AddString = "25" }, { CCS_AddString = "29.97" },
+    { CCS_AddString = "30" }, { CCS_AddString = "48" }, { CCS_AddString = "50" }, { CCS_AddString = "59.94" },
+    { CCS_AddString = "60" }, { CCS_AddString = "90" }, { CCS_AddString = "100" }, { CCS_AddString = "120" },
+  })
+
+  M_AlignPeak = self:AddInput("Align Peak to Cycle Start", "AlignPeak", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "CheckboxControl",
+    INP_Default = 1,
+  })
+
+  M_BeatsPerBar = self:AddInput("Beats per Bar (Time Sig)", "BeatsPerBar", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    INP_Integer = true,
+    INP_Default = 4,
+    INP_MinScale = 1, INP_MaxScale = 12,
+  })
+
+  M_Operation = self:AddInput("Final Operation", "Operation", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "ComboControl",
+    INP_Default = 0,
+    INP_Integer = true,
+    { CCS_AddString = "Add: input + sum" },
+    { CCS_AddString = "Multiply: input*(1+sum)" },
+    { CCS_AddString = "Replace: sum" },
+  })
+
+  self:EndControlNest()
+
+  local function addLayer(i, expandedDefault)
+    local layer = L[i]
+
+    self:BeginControlNest("Pulse " .. tostring(i), "NestL" .. tostring(i), expandedDefault)
+
+    layer.Enabled = self:AddInput("Enable Pulse " .. tostring(i), "L" .. i .. "_Enable", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "CheckboxControl",
+      INP_Default = (i == 1) and 1 or 0,
+      INP_DoNotifyChanged = true,
+      INP_Integer = true,
+      INP_External = false, -- hide keyframe/connection UI
+    })
+
+    layer.TimingMode = self:AddInput("Pulse Timing", "L" .. i .. "_TimingMode", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "ComboControl",
+      INP_Default = 0,
+      INP_Integer = true,
+      INP_DoNotifyChanged = true,
+      { CCS_AddString = "Manual (beats)" },
+      { CCS_AddString = "Musical (notes)" },
+    })
+
+    layer.Division = self:AddInput("Note Division", "L" .. i .. "_Division", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "ComboControl",
+      INP_Default = 5, -- Quarter
+      INP_Integer = true,
+      INP_DoNotifyChanged = true,
+      { CCS_AddString = "1 Bar" },
+      { CCS_AddString = "1/2 Bar" },
+      { CCS_AddString = "1/4 Bar" },
+      { CCS_AddString = "Whole" },
+      { CCS_AddString = "Half" },
+      { CCS_AddString = "Quarter" },
+      { CCS_AddString = "Eighth" },
+      { CCS_AddString = "16th" },
+      { CCS_AddString = "32nd" },
+    })
+
+    layer.Feel = self:AddInput("Feel", "L" .. i .. "_Feel", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "ComboControl",
+      INP_Default = 0,
+      INP_Integer = true,
+      INP_DoNotifyChanged = true,
+      { CCS_AddString = "Straight" },
+      { CCS_AddString = "Triplet" },
+      { CCS_AddString = "Dotted" },
+    })
+
+    layer.PulseEveryBeats = self:AddInput("Pulse Every (beats)", "L" .. i .. "_PulseEvery", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = 1,
+      INP_MinScale = 0.125, INP_MaxScale = 64,
+    })
+
+    layer.GenMode = self:AddInput("Generator Mode", "L" .. i .. "_GenMode", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "ComboControl",
+      INP_Default = 0,
+      INP_Integer = true,
+      { CCS_AddString = "Pulse (Envelope)" },
+      { CCS_AddString = "Oscillator (Waveform)" },
+    })
+
+    layer.WaveType = self:AddInput("Wave Type", "L" .. i .. "_WaveType", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "ComboControl",
+      INP_Default = 1,
+      INP_Integer = true,
+      { CCS_AddString = "Sine" },
+      { CCS_AddString = "Cosine" },
+      { CCS_AddString = "Square" },
+      { CCS_AddString = "Saw" },
+    })
+
+    layer.Polarity = self:AddInput("Polarity", "L" .. i .. "_Polarity", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "ComboControl",
+      INP_Default = 0,
+      INP_Integer = true,
+      { CCS_AddString = "Unipolar (0..1)" },
+      { CCS_AddString = "Bipolar (-1..1)" },
+    })
+
+    layer.LinkAR = self:AddInput("Link Attack/Release", "L" .. i .. "_LinkAR", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "CheckboxControl",
+      INP_Default = 0,
+      INP_DoNotifyChanged = true,
+    })
+
+    layer.AttackLen = self:AddInput("Attack Length % (half-cycle)", "L" .. i .. "_AtkLen", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = 30,
+      INP_MinScale = 0, INP_MaxScale = 100,
+      INP_DoNotifyChanged = true,
+    })
+
+    layer.ReleaseLen = self:AddInput("Release Length % (half-cycle)", "L" .. i .. "_RelLen", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = 30,
+      INP_MinScale = 0, INP_MaxScale = 100,
+      INP_DoNotifyChanged = true,
+    })
+
+    layer.AttackCurve = self:AddInput("Attack Curve", "L" .. i .. "_AtkCurve", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = 1,
+      INP_MinScale = 0.25, INP_MaxScale = 16,
+      INP_DoNotifyChanged = true,
+    })
+
+    layer.ReleaseCurve = self:AddInput("Release Curve", "L" .. i .. "_RelCurve", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = 1,
+      INP_MinScale = 0.25, INP_MaxScale = 16,
+      INP_DoNotifyChanged = true,
+    })
+
+    layer.ShapePow = self:AddInput("Shape Power", "L" .. i .. "_Shape", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = 1,
+      INP_MinScale = 0.25, INP_MaxScale = 192,
+    })
+
+    layer.Invert = self:AddInput("Invert", "L" .. i .. "_Invert", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "CheckboxControl",
+      INP_Default = 0,
+    })
+
+    layer.PhaseMode = self:AddInput("Phase", "L" .. i .. "_PhaseMode", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "ComboControl",
+      INP_Default = 0,
+      INP_Integer = true,
+      { CCS_AddString = "On Beat" },
+      { CCS_AddString = "Offbeat (half-cycle)" },
+      { CCS_AddString = "Custom (beats)" },
+    })
+
+    layer.PhaseBeats = self:AddInput("Custom Phase (beats)", "L" .. i .. "_PhaseBeats", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = 0,
+      INP_MinScale = -64, INP_MaxScale = 64,
+    })
+
+    layer.Amount = self:AddInput("Amount", "L" .. i .. "_Amount", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "SliderControl",
+      INP_Default = (i == 1) and 0.5 or 0.25,
+      INP_MinScale = -5, INP_MaxScale = 5,
+    })
+
+    -- Track controls for enable/disable sweep
+    layer._allControls = {
+      layer.Enabled,
+      layer.TimingMode, layer.Division, layer.Feel, layer.PulseEveryBeats,
+      layer.GenMode, layer.WaveType, layer.Polarity,
+      layer.LinkAR, layer.AttackLen, layer.ReleaseLen, layer.AttackCurve, layer.ReleaseCurve,
+      layer.ShapePow, layer.Invert, layer.PhaseMode, layer.PhaseBeats, layer.Amount
+    }
+
+    self:EndControlNest()
+
+    -- Initialize disabled state + timing state
+    refreshPulseEnabledUI(i)
+  end
+
+  -- Pulse nests: P1 expanded, others collapsed
+  addLayer(1, true)
+  addLayer(2, false)
+  addLayer(3, false)
+  addLayer(4, false)
+
+  print("[BeatPulseModifier] Create() OK")
+end
+
+-- ---------- UI reactions ----------
+function NotifyChanged(inp, param, time)
+  for i = 1, 4 do
+    local layer = L[i]
+
+    if inp == layer.Enabled then
+      refreshPulseEnabledUI(i)
+    end
+
+    if inp == layer.TimingMode or inp == layer.Division or inp == layer.Feel then
+      refreshPulseEnabledUI(i)
+    end
+
+    if inp == layer.LinkAR then
+      refreshPulseEnabledUI(i)
+      syncReleaseToAttack(i)
+    end
+
+    if layer.LinkAR and (layer.LinkAR:GetSource(0).Value >= 0.5) then
+      if inp == layer.AttackLen or inp == layer.AttackCurve then
+        syncReleaseToAttack(i)
+      end
+    end
+  end
+end
+
+function OnAddToFlow()
+  for i = 1, 4 do
+    refreshPulseEnabledUI(i)
+    syncReleaseToAttack(i)
+  end
+end
+
+-- ---------- Process ----------
+function Process(req)
+  local input = InParameter:GetValue(req).Value
+
+  local bpm = clamp(M_BPM:GetValue(req).Value, 0.0001, 100000)
+  local fps = clamp(presetIndexToFPS(M_FPSPreset:GetValue(req).Value), 0.0001, 100000)
+  local align = (M_AlignPeak:GetValue(req).Value >= 0.5)
+  local beatsPerBar = clamp(M_BeatsPerBar:GetValue(req).Value, 1, 12)
+
+  -- Sum pulses
+  local sum = 0.0
+  sum = sum + evalLayer(1, req, bpm, fps, align, beatsPerBar)
+  sum = sum + evalLayer(2, req, bpm, fps, align, beatsPerBar)
+  sum = sum + evalLayer(3, req, bpm, fps, align, beatsPerBar)
+  sum = sum + evalLayer(4, req, bpm, fps, align, beatsPerBar)
+
+  -- Apply final operation
+  local op = math.floor(M_Operation:GetValue(req).Value + 0.5)
+  local out
+  if op == 0 then
+    out = input + sum
+  elseif op == 1 then
+    out = input * (1.0 + sum)
+  else
+    out = sum
+  end
+
+  OutValue:Set(req, Number(out))
+end
