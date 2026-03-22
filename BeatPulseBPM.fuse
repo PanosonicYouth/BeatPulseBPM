@@ -1,23 +1,31 @@
 -- BeatPulseModifier.fuse (Resolve 20)
--- Version: v0.1.2
--- Build: 2026-03-18
+-- Version: v0.1.3
+-- Build: 2026-03-20
 -- 4-pulse stacked beat modifier with collapsible UI + per-pulse enable.
 -- Master: BPM/FPS + alignment + time signature + final operation
 -- Pulses: independent settings summed together
 -- Each Pulse can use Manual (beats) OR Musical (division + feel)
 --
--- v0.2.0 changes:
---   - INP_External = false added to structural combos (GenMode, M_Operation,
---     M_FPSPreset) to prevent keyframe crashes on controls that must not animate
---   - Division, Feel, WaveType, Polarity remain keyframeable (safe: all reads
---     use math.floor round to protect against float interpolation)
---   - NotifyChanged: nil guard added to prevent crash during early load
---   - beatsPerBar: floored at read-time to prevent fractional division values
---   - Phase calculation: fract(cycleCount) computed directly to maintain
---     precision on long timelines (prevents phase drift beyond ~1000 frames)
---   - Removed unnecessary INP_DoNotifyChanged from AttackLen, ReleaseLen,
---     AttackCurve, ReleaseCurve (NotifyChanged never acts on these)
---   - math.pow skipped when exponent == 1.0 (ShapePow, AttackCurve, ReleaseCurve)
+-- v0.1.3 changes:
+--   - Per-pulse Mute checkbox added: silences a pulse without greying out
+--     its controls. Keyframeable — use Step keyframes to gate a pulse on/off
+--     at specific points in the timeline.
+--   - Default Amount changed to 0 for all pulses: modifier is transparent
+--     until the user dials in an amount.
+--   - Master Amount added: a single multiplier applied to the summed output
+--     before the final operation. Useful for fading the whole effect in/out
+--     without touching individual pulse amounts.
+--   - Full Cycle checkbox added per pulse (Oscillator mode only): bypasses
+--     the envelope entirely for a raw unmodified waveform. Enables true
+--     linear saw and square waves with no tapering at cycle boundaries.
+--     When checked, Attack, Release, and Shape Power controls are greyed out
+--     as they have no effect. UI greying reflects last NotifyChanged state —
+--     cosmetic only, computed output is always correct.
+--   - Triangle wave added as a 5th Wave Type: a perfect linear ramp up then
+--     down, peaking at the cycle midpoint. In Oscillator mode with Full Cycle
+--     enabled gives a true unmodified triangle. In Pulse mode uses the cosine
+--     envelope profile like Sine.
+--   - FPS presets expanded: added 72 (VR/gaming) and 240 (high speed).
 
 FuRegisterClass("BeatPulseModifier", CT_Modifier, {
   REGS_Category       = "Modifiers",
@@ -31,7 +39,7 @@ FuRegisterClass("BeatPulseModifier", CT_Modifier, {
   REG_TimeVariant     = true,
   REGB_Temporal       = true,
 
-  REG_Version         = 112,
+  REG_Version         = 113,
 })
 
 print("[BeatPulseModifier] loaded")
@@ -45,6 +53,7 @@ M_BPM = nil
 M_FPSPreset = nil
 M_AlignPeak = nil
 M_BeatsPerBar = nil
+M_MasterAmount = nil
 M_Operation = nil
 
 -- Per-pulse control tables
@@ -67,18 +76,22 @@ local function fract(x) return x - math.floor(x) end
 local function wrapHalf(x) return x - math.floor(x + 0.5) end
 
 local function presetIndexToFPS(idx)
-  local map = { 23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 90.0, 100.0, 120.0 }
+  local map = {
+    23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0,
+    59.94, 60.0, 72.0, 90.0, 100.0, 120.0, 240.0
+  }
   idx = math.floor(idx + 0.5)
   if idx < 0 then idx = 0 end
-  if idx > 11 then idx = 11 end
+  if idx > 13 then idx = 13 end
   return map[idx + 1]
 end
 
 local function autoPeakPos(wt)
-  -- 0=sine, 1=cos, 2=square, 3=saw
+  -- 0=sine, 1=cos, 2=square, 3=saw, 4=triangle
   if wt == 0 then return 0.25 end
   if wt == 1 then return 0.00 end
   if wt == 3 then return 0.50 end
+  if wt == 4 then return 0.25 end
   return 0.00
 end
 
@@ -136,7 +149,6 @@ local function fixedPeakEnv(x, atkW, relW, acv, rcv, wtProfile)
     d = (-x) / atkW
     if d >= 1.0 then return 0.0 end
     if wtProfile == 3 then
-      -- FIX #6: skip math.pow when exponent is 1.0
       return (acv == 1.0) and (1.0 - d) or math.pow(1.0 - d, acv)
     elseif wtProfile == 2 then
       return 1.0
@@ -179,15 +191,33 @@ local function refreshPulseEnabledUI(i)
   setDisabled(layer.ReleaseLen, link)
   setDisabled(layer.ReleaseCurve, link)
 
-  -- Grey out Custom Phase unless Phase = Custom (beats)
-  local pmUI = math.floor(layer.PhaseMode:GetSource(0).Value + 0.5) -- 0 On, 1 Off, 2 Custom
+  local pmUI = math.floor(layer.PhaseMode:GetSource(0).Value + 0.5)
   setDisabled(layer.PhaseBeats, pmUI ~= 2)
+
+  -- Grey out envelope controls when Full Cycle is active in Oscillator mode.
+  -- Note: greying reflects the last NotifyChanged state, not the current
+  -- frame's keyframe value. Cosmetic only — computed output is always correct.
+  local fullCycle = (layer.FullCycle:GetSource(0).Value >= 0.5)
+  local gen = math.floor(layer.GenMode:GetSource(0).Value + 0.5)
+  local envelopeDisabled = (fullCycle and gen == 1)
+  setDisabled(layer.AttackLen,    envelopeDisabled)
+  setDisabled(layer.ReleaseLen,   envelopeDisabled)
+  setDisabled(layer.AttackCurve,  envelopeDisabled)
+  setDisabled(layer.ReleaseCurve, envelopeDisabled)
+  setDisabled(layer.ShapePow,     envelopeDisabled)
 end
 
 -- ---------- Compute pulse contribution at time req ----------
 local function evalLayer(i, req, masterBPM, masterFPS, masterAlignPeak, beatsPerBar)
   local layer = L[i]
+
+  -- Disabled entirely: UI greyed out
   if layer.Enabled:GetValue(req).Value < 0.5 then
+    return 0.0
+  end
+
+  -- Muted: UI active but output silenced. Keyframeable for timeline gating.
+  if layer.Mute:GetValue(req).Value >= 0.5 then
     return 0.0
   end
 
@@ -210,18 +240,16 @@ local function evalLayer(i, req, masterBPM, masterFPS, masterAlignPeak, beatsPer
 
   local shp = clamp(layer.ShapePow:GetValue(req).Value, 0.0001, 100000)
 
-  local pm = math.floor(layer.PhaseMode:GetValue(req).Value + 0.5) -- 0 on, 1 off, 2 custom
+  local pm = math.floor(layer.PhaseMode:GetValue(req).Value + 0.5)
   local pb = layer.PhaseBeats:GetValue(req).Value
   if pm == 0 then pb = 0 end
   if pm == 1 then pb = peb / 2.0 end
 
-  -- FIX #4: compute fract(cycleCount) directly to avoid precision loss on
-  -- long timelines. Previously phase could reach ~18,000+ at high BPM / long
-  -- comps, causing float precision to degrade when extracting the remainder.
+  -- fract(cycleCount) computed directly to avoid precision loss on long timelines
   local t = req.Time / masterFPS
   local cyclesPerSec = (masterBPM / 60.0) / peb
   local cycleCount = cyclesPerSec * t + (pb / peb)
-  local phaseFrac = fract(cycleCount)   -- always in [0,1), precision preserved
+  local phaseFrac = fract(cycleCount)
 
   local peakPos
   if masterAlignPeak then
@@ -235,13 +263,17 @@ local function evalLayer(i, req, masterBPM, masterFPS, masterAlignPeak, beatsPer
   local atkW = math.max(1e-6, (atkPct / 100.0) * 0.5)
   local relW = math.max(1e-6, (relPct / 100.0) * 0.5)
 
-  local env = fixedPeakEnv(x, atkW, relW, acv, rcv, wt)
-  -- FIX #6: skip math.pow when ShapePow == 1.0
-  env = (shp == 1.0) and env or math.pow(env, shp)
+  local env
+  if gen == 1 and layer.FullCycle:GetValue(req).Value >= 0.5 then
+    -- Full Cycle: bypass envelope entirely for a raw unmodified waveform
+    env = 1.0
+  else
+    env = fixedPeakEnv(x, atkW, relW, acv, rcv, wt)
+    env = (shp == 1.0) and env or math.pow(env, shp)
+  end
   if inv then env = 1.0 - env end
 
   local wave = 0.0
-  -- phase in radians only needed for the oscillator path
   local twoPi = 2.0 * math.pi
   local phase = phaseFrac * twoPi
 
@@ -257,15 +289,24 @@ local function evalLayer(i, req, masterBPM, masterFPS, masterAlignPeak, beatsPer
     local c = math.cos(phase)
     local sq = (s >= 0) and 1 or -1
     local saw = 2.0 * (phaseFrac - math.floor(phaseFrac + 0.5))
+    local tri = 1.0 - 4.0 * math.abs(phaseFrac - 0.5)
 
     local osc = s
     if wt == 1 then osc = c
     elseif wt == 2 then osc = sq
     elseif wt == 3 then osc = saw
+    elseif wt == 4 then osc = tri
     end
 
     if pol == 0 then
-      local osc01 = (wt == 2) and ((s >= 0) and 1 or 0) or clamp(0.5 * (osc + 1.0), 0.0, 1.0)
+      local osc01
+      if wt == 2 then
+        osc01 = (s >= 0) and 1 or 0
+      elseif wt == 4 then
+        osc01 = clamp(0.5 * (tri + 1.0), 0.0, 1.0)
+      else
+        osc01 = clamp(0.5 * (osc + 1.0), 0.0, 1.0)
+      end
       wave = osc01 * env
     else
       wave = osc * env
@@ -302,16 +343,18 @@ function Create()
     INP_MinScale = 1, INP_MaxScale = 300,
   })
 
-  -- FIX #1: INP_External = false — FPS is structural, must not be keyframed
+  -- INP_External = false: FPS is structural, must not be keyframed
   M_FPSPreset = self:AddInput("FPS Preset", "FPSPreset", {
     LINKID_DataType = "Number",
     INPID_InputControl = "ComboControl",
     INP_Default = 4, -- 30fps
     INP_Integer = true,
     INP_External = false,
-    { CCS_AddString = "23.976" }, { CCS_AddString = "24" }, { CCS_AddString = "25" }, { CCS_AddString = "29.97" },
-    { CCS_AddString = "30" }, { CCS_AddString = "48" }, { CCS_AddString = "50" }, { CCS_AddString = "59.94" },
-    { CCS_AddString = "60" }, { CCS_AddString = "90" }, { CCS_AddString = "100" }, { CCS_AddString = "120" },
+    { CCS_AddString = "23.976" }, { CCS_AddString = "24" }, { CCS_AddString = "25" },
+    { CCS_AddString = "29.97" }, { CCS_AddString = "30" }, { CCS_AddString = "48" },
+    { CCS_AddString = "50" }, { CCS_AddString = "59.94" }, { CCS_AddString = "60" },
+    { CCS_AddString = "72" }, { CCS_AddString = "90" }, { CCS_AddString = "100" },
+    { CCS_AddString = "120" }, { CCS_AddString = "240" },
   })
 
   M_AlignPeak = self:AddInput("Align Peak to Cycle Start", "AlignPeak", {
@@ -328,11 +371,21 @@ function Create()
     INP_MinScale = 1, INP_MaxScale = 12,
   })
 
-  -- FIX #1: INP_External = false — operation mode is structural, must not be keyframed
+  -- Master Amount: multiplier on the summed output before the final operation.
+  -- Keyframeable — use to fade the whole effect in/out without touching
+  -- individual pulse amounts.
+  M_MasterAmount = self:AddInput("Master Amount", "MasterAmount", {
+    LINKID_DataType = "Number",
+    INPID_InputControl = "SliderControl",
+    INP_Default = 1.0,
+    INP_MinScale = 0.0, INP_MaxScale = 2.0,
+  })
+
+  -- INP_External = false: operation mode is structural, must not be keyframed
   M_Operation = self:AddInput("Final Operation", "Operation", {
     LINKID_DataType = "Number",
     INPID_InputControl = "ComboControl",
-    INP_Default = 0, -- Add
+    INP_Default = 0,
     INP_Integer = true,
     INP_External = false,
     { CCS_AddString = "Add: input + sum" },
@@ -356,11 +409,20 @@ function Create()
       INP_External = false,
     })
 
-    -- FIX #1: INP_External = false — timing mode is structural, must not be keyframed
+    -- Mute: silences the pulse output without greying out controls.
+    -- Keyframeable — set Step keyframes to gate a pulse on/off mid-timeline.
+    layer.Mute = self:AddInput("Mute", "L" .. i .. "_Mute", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "CheckboxControl",
+      INP_Default = 0,
+      INP_Integer = true,
+    })
+
+    -- INP_External = false: timing mode is structural, must not be keyframed
     layer.TimingMode = self:AddInput("Pulse Timing", "L" .. i .. "_TimingMode", {
       LINKID_DataType = "Number",
       INPID_InputControl = "ComboControl",
-      INP_Default = 1, -- Musical by default
+      INP_Default = 1,
       INP_Integer = true,
       INP_DoNotifyChanged = true,
       INP_External = false,
@@ -368,13 +430,14 @@ function Create()
       { CCS_AddString = "Musical (notes)" },
     })
 
-    -- Division, Feel, WaveType, Polarity: intentionally left keyframeable.
-    -- All reads use math.floor(... + 0.5) so float interpolation between
-    -- keyframes is safely quantised to valid integer indices.
+    -- Division, Feel, WaveType, Polarity: intentionally keyframeable.
+    -- All reads use math.floor(... + 0.5) to safely quantise float interpolation.
+    -- When keyframing these controls mid-timeline, set interpolation to Step
+    -- manually in the spline editor.
     layer.Division = self:AddInput("Note Division", "L" .. i .. "_Division", {
       LINKID_DataType = "Number",
       INPID_InputControl = "ComboControl",
-      INP_Default = 5, -- Quarter (1 beat)
+      INP_Default = 5,
       INP_Integer = true,
       INP_DoNotifyChanged = true,
       { CCS_AddString = "1 Bar (Time Sig)" },
@@ -391,7 +454,7 @@ function Create()
     layer.Feel = self:AddInput("Feel", "L" .. i .. "_Feel", {
       LINKID_DataType = "Number",
       INPID_InputControl = "ComboControl",
-      INP_Default = 0, -- Straight
+      INP_Default = 0,
       INP_Integer = true,
       INP_DoNotifyChanged = true,
       { CCS_AddString = "Straight" },
@@ -406,32 +469,44 @@ function Create()
       INP_MinScale = 0.125, INP_MaxScale = 64,
     })
 
-    -- FIX #1: INP_External = false — generator mode is structural, must not be keyframed
+    -- INP_External = false: generator mode is structural, must not be keyframed
     layer.GenMode = self:AddInput("Generator Mode", "L" .. i .. "_GenMode", {
       LINKID_DataType = "Number",
       INPID_InputControl = "ComboControl",
-      INP_Default = 0, -- Pulse
+      INP_Default = 0,
       INP_Integer = true,
       INP_External = false,
       { CCS_AddString = "Pulse (Envelope)" },
       { CCS_AddString = "Oscillator (Waveform)" },
     })
 
+    -- Full Cycle: only active in Oscillator mode. Bypasses the envelope
+    -- entirely, giving a raw unmodified waveform with no tapering at cycle
+    -- boundaries. Use for a true linear saw or square wave.
+    layer.FullCycle = self:AddInput("Full Cycle (Oscillator only)", "L" .. i .. "_FullCycle", {
+      LINKID_DataType = "Number",
+      INPID_InputControl = "CheckboxControl",
+      INP_Default = 0,
+      INP_Integer = true,
+      INP_DoNotifyChanged = true,
+    })
+
     layer.WaveType = self:AddInput("Wave Type", "L" .. i .. "_WaveType", {
       LINKID_DataType = "Number",
       INPID_InputControl = "ComboControl",
-      INP_Default = 1, -- Cosine
+      INP_Default = 1,
       INP_Integer = true,
       { CCS_AddString = "Sine" },
       { CCS_AddString = "Cosine" },
       { CCS_AddString = "Square" },
       { CCS_AddString = "Saw" },
+      { CCS_AddString = "Triangle" },
     })
 
     layer.Polarity = self:AddInput("Polarity", "L" .. i .. "_Polarity", {
       LINKID_DataType = "Number",
       INPID_InputControl = "ComboControl",
-      INP_Default = 0, -- Unipolar
+      INP_Default = 0,
       INP_Integer = true,
       { CCS_AddString = "Unipolar (0..1)" },
       { CCS_AddString = "Bipolar (-1..1)" },
@@ -444,7 +519,7 @@ function Create()
       INP_DoNotifyChanged = true,
     })
 
-    -- FIX #5: removed INP_DoNotifyChanged — NotifyChanged never acts on these
+    -- INP_DoNotifyChanged removed: NotifyChanged never acts on these four
     layer.AttackLen = self:AddInput("Attack Length % (half-cycle)", "L" .. i .. "_AtkLen", {
       LINKID_DataType = "Number",
       INPID_InputControl = "SliderControl",
@@ -486,10 +561,11 @@ function Create()
       INP_Default = 0,
     })
 
+    -- INP_External = false: phase mode must not be keyframed (crash risk)
     layer.PhaseMode = self:AddInput("Phase", "L" .. i .. "_PhaseMode", {
       LINKID_DataType = "Number",
       INPID_InputControl = "ComboControl",
-      INP_Default = 0, -- On Beat
+      INP_Default = 0,
       INP_Integer = true,
       INP_DoNotifyChanged = true,
       INP_External = false,
@@ -506,17 +582,19 @@ function Create()
       INP_DoNotifyChanged = true,
     })
 
+    -- Default Amount = 0: modifier is transparent until user dials in a value
     layer.Amount = self:AddInput("Amount", "L" .. i .. "_Amount", {
       LINKID_DataType = "Number",
       INPID_InputControl = "SliderControl",
-      INP_Default = (i == 1) and 0.2 or 0.25,
+      INP_Default = 0,
       INP_MinScale = -5, INP_MaxScale = 5,
     })
 
     layer._allControls = {
       layer.Enabled,
+      layer.Mute,
       layer.TimingMode, layer.Division, layer.Feel, layer.PulseEveryBeats,
-      layer.GenMode, layer.WaveType, layer.Polarity,
+      layer.GenMode, layer.FullCycle, layer.WaveType, layer.Polarity,
       layer.LinkAR, layer.AttackLen, layer.ReleaseLen, layer.AttackCurve, layer.ReleaseCurve,
       layer.ShapePow, layer.Invert, layer.PhaseMode, layer.PhaseBeats, layer.Amount
     }
@@ -535,8 +613,7 @@ function Create()
 end
 
 function NotifyChanged(inp, param, time)
-  -- FIX #2: nil guard — NotifyChanged can fire before Create() has finished
-  -- populating L during load or fast comp switching
+  -- Nil guard: NotifyChanged can fire before Create() has finished populating L
   if not L[1].Enabled then return end
 
   for i = 1, 4 do
@@ -547,6 +624,7 @@ function NotifyChanged(inp, param, time)
     or inp == layer.Feel
     or inp == layer.LinkAR
     or inp == layer.PhaseMode
+    or inp == layer.FullCycle
     then
       refreshPulseEnabledUI(i)
     end
@@ -565,17 +643,18 @@ function Process(req)
   local bpm = clamp(M_BPM:GetValue(req).Value, 0.0001, 100000)
   local fps = clamp(presetIndexToFPS(M_FPSPreset:GetValue(req).Value), 0.0001, 100000)
   local align = (M_AlignPeak:GetValue(req).Value >= 0.5)
-
-  -- FIX #3: floor beatsPerBar at read-time — INP_Integer snaps the UI but
-  -- GetValue returns a raw float; fractional values cause subtle phase drift
-  -- in Musical timing divisions (e.g. beatsPerBar/2 giving 1.9999 vs 2.0)
+  -- Floored at read-time: INP_Integer snaps UI but GetValue returns raw float
   local beatsPerBar = math.floor(clamp(M_BeatsPerBar:GetValue(req).Value + 0.5, 1, 12))
+  local masterAmount = M_MasterAmount:GetValue(req).Value
 
   local sum = 0.0
   sum = sum + evalLayer(1, req, bpm, fps, align, beatsPerBar)
   sum = sum + evalLayer(2, req, bpm, fps, align, beatsPerBar)
   sum = sum + evalLayer(3, req, bpm, fps, align, beatsPerBar)
   sum = sum + evalLayer(4, req, bpm, fps, align, beatsPerBar)
+
+  -- Apply Master Amount to the summed output before the final operation
+  sum = sum * masterAmount
 
   local op = math.floor(M_Operation:GetValue(req).Value + 0.5)
   local out
